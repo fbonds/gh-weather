@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 weather.py — Weather monitor for Gig Harbor, WA
-Fetches current conditions and forecast from wttr.in,
+Fetches current conditions and forecast from the National Weather Service,
 displays in a terminal dashboard with automatic refresh.
 """
 
@@ -31,7 +31,12 @@ from Quartz.CoreGraphics import (
 STATION = "Gig+Harbor"
 STATION_DISPLAY = "GIG HARBOR, WA"
 
-ENDPOINT = f"https://wttr.in/{STATION}?format=j1"
+# National Weather Service API (https://www.weather.gov/documentation/services-web-api)
+# Free, no key; NWS asks for a User-Agent identifying the app.
+NWS_POINTS_ENDPOINT = "https://api.weather.gov/points/{lat},{lon}"
+NWS_HEADERS = {"User-Agent": "gh-weather (fbonds@gmail.com)", "Accept": "application/geo+json"}
+NWS_LAT = 47.3293         # Gig Harbor, WA
+NWS_LON = -122.5804
 BASE_INTERVAL = 60
 
 # EPA AirNow air quality (https://docs.airnowapi.org/)
@@ -121,32 +126,144 @@ def _sync_display(dx, dy):
 # Weather data helpers
 # ---------------------------------------------------------------------------
 
-def fetch_conditions():
-    """Pull current conditions and forecast from weather service."""
+# The /points lookup (forecast URL + nearby stations) never changes for a fixed
+# location, so it's resolved once and reused.
+_NWS_POINT = {}
+
+_COMPASS_16 = ["N", "NNE", "NE", "ENE", "E", "ESE", "SE", "SSE",
+               "S", "SSW", "SW", "WSW", "W", "WNW", "NW", "NNW"]
+
+# METAR cloud-layer amounts -> approximate sky cover percent.
+_CLOUD_PCT = {"SKC": 0, "CLR": 0, "NCD": 0, "FEW": 20, "SCT": 40, "BKN": 75,
+              "OVC": 100, "VV": 100}
+
+
+def _nws_get(url):
+    resp = requests.get(url, headers=NWS_HEADERS, timeout=10)
+    resp.raise_for_status()
+    return resp.json()
+
+
+def _nws_value(props, key):
+    """Numeric value of an NWS quantity field, or None when missing/null."""
+    return (props.get(key) or {}).get("value")
+
+
+def _fmt(value, fmt="{:.0f}"):
+    return "--" if value is None else fmt.format(value)
+
+
+def compute_sun_times(lat, lon, day):
+    """
+    Local sunrise/sunset as '07:12 AM' strings (NOAA solar equations).
+    NWS doesn't publish these, so they're calculated for the location.
+    """
     try:
-        resp = requests.get(ENDPOINT, timeout=10)
-        resp.raise_for_status()
-        response = resp.json()
-        
-        # Extract data from wrapper if present
-        if "data" in response:
-            data = response["data"]
-        else:
-            data = response
-        
-        # Validate response has expected structure
-        if not data or "current_condition" not in data:
-            return None, "Invalid response structure"
-        if not data["current_condition"]:
-            return None, "Empty current conditions"
-            
+        n = day.timetuple().tm_yday
+        g = 2 * math.pi / 365 * (n - 1)
+        eqtime = 229.18 * (0.000075 + 0.001868 * math.cos(g) - 0.032077 * math.sin(g)
+                           - 0.014615 * math.cos(2 * g) - 0.040849 * math.sin(2 * g))
+        decl = (0.006918 - 0.399912 * math.cos(g) + 0.070257 * math.sin(g)
+                - 0.006758 * math.cos(2 * g) + 0.000907 * math.sin(2 * g)
+                - 0.002697 * math.cos(3 * g) + 0.00148 * math.sin(3 * g))
+        phi = math.radians(lat)
+        ha = math.degrees(math.acos(
+            math.cos(math.radians(90.833)) / (math.cos(phi) * math.cos(decl))
+            - math.tan(phi) * math.tan(decl)))
+        utc_offset_min = (datetime.now().astimezone().utcoffset().total_seconds()) / 60
+        midnight = datetime(day.year, day.month, day.day)
+
+        def at(minutes_utc):
+            return (midnight + timedelta(minutes=minutes_utc + utc_offset_min)).strftime("%I:%M %p")
+
+        return at(720 - 4 * (lon + ha) - eqtime), at(720 - 4 * (lon - ha) - eqtime)
+    except (ValueError, ZeroDivisionError):
+        return "--", "--"
+
+
+def fetch_conditions():
+    """
+    Pull current conditions (nearest reporting NWS station) and the hourly
+    forecast from api.weather.gov, reshaped into the dict layout the renderer
+    expects: {"current_condition": [...], "weather": [{"astronomy", "hourly"}]}.
+    """
+    try:
+        if not _NWS_POINT:
+            point = _nws_get(NWS_POINTS_ENDPOINT.format(lat=NWS_LAT, lon=NWS_LON))["properties"]
+            stations = _nws_get(point["observationStations"])["features"]
+            _NWS_POINT["forecast_hourly"] = point["forecastHourly"]
+            _NWS_POINT["stations"] = [s["properties"]["stationIdentifier"] for s in stations[:4]]
+
+        # Nearest station first; fall through if it hasn't reported a temperature.
+        obs = None
+        for station in _NWS_POINT["stations"]:
+            props = _nws_get(
+                f"https://api.weather.gov/stations/{station}/observations/latest"
+            )["properties"]
+            if _nws_value(props, "temperature") is not None:
+                obs = props
+                break
+        if obs is None:
+            return None, "No station reporting"
+
+        c_to_f = lambda c: None if c is None else c * 9 / 5 + 32
+        temp_f = c_to_f(_nws_value(obs, "temperature"))
+        feels_c = _nws_value(obs, "heatIndex")
+        if feels_c is None:
+            feels_c = _nws_value(obs, "windChill")
+        feels_f = c_to_f(feels_c) if feels_c is not None else temp_f
+
+        wind_kmh = _nws_value(obs, "windSpeed")
+        wind_deg = _nws_value(obs, "windDirection")
+        pressure_pa = _nws_value(obs, "barometricPressure")
+        vis_m = _nws_value(obs, "visibility")
+        precip_mm = _nws_value(obs, "precipitationLastHour")
+
+        layers = obs.get("cloudLayers") or []
+        cloud = max((_CLOUD_PCT.get(l.get("amount"), 0) for l in layers), default=None)
+
+        current = {
+            "temp_F": _fmt(temp_f),
+            "FeelsLikeF": _fmt(feels_f),
+            "humidity": _fmt(_nws_value(obs, "relativeHumidity")),
+            "windspeedMiles": _fmt(None if wind_kmh is None else wind_kmh / 1.609344),
+            "winddir16Point": "" if wind_deg is None else _COMPASS_16[int((wind_deg + 11.25) // 22.5) % 16],
+            "pressureInches": _fmt(None if pressure_pa is None else pressure_pa / 3386.389, "{:.2f}"),
+            "visibilityMiles": _fmt(None if vis_m is None else vis_m / 1609.344),
+            "cloudcover": _fmt(cloud),
+            "uvIndex": "--",   # not published by NWS
+            "precipInches": _fmt(0.0 if precip_mm is None else precip_mm / 25.4, "{:.1f}"),
+            "weatherDesc": [{"value": obs.get("textDescription") or "--"}],
+        }
+
+        # Hourly forecast is a nice-to-have; conditions still show without it.
+        hourly = []
+        try:
+            periods = _nws_get(_NWS_POINT["forecast_hourly"])["properties"]["periods"]
+            for p in periods[:24]:
+                start = datetime.fromisoformat(p["startTime"])
+                temp = p.get("temperature")
+                if p.get("temperatureUnit") == "C" and temp is not None:
+                    temp = round(temp * 9 / 5 + 32)
+                hourly.append({"time": str(start.hour * 100), "tempF": str(temp)})
+        except (requests.exceptions.RequestException, KeyError, ValueError):
+            pass
+
+        sunrise, sunset = compute_sun_times(NWS_LAT, NWS_LON, datetime.now())
+        data = {
+            "current_condition": [current],
+            "weather": [{"astronomy": [{"sunrise": sunrise, "sunset": sunset}],
+                         "hourly": hourly}],
+        }
         return data, None
     except requests.exceptions.Timeout:
         return None, "Request timeout"
     except requests.exceptions.RequestException as e:
         return None, f"Network error: {str(e)[:30]}"
-    except json.JSONDecodeError:
+    except (json.JSONDecodeError, ValueError):
         return None, "Invalid JSON response"
+    except (KeyError, IndexError, TypeError):
+        return None, "Invalid response structure"
     except Exception as e:
         return None, f"Error: {str(e)[:30]}"
 
