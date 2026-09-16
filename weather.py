@@ -39,6 +39,11 @@ NWS_LAT = 47.3293         # Gig Harbor, WA
 NWS_LON = -122.5804
 BASE_INTERVAL = 60
 
+# Open-Meteo (https://open-meteo.com/) — free, no API key. NWS publishes no UV
+# index, so UV comes from here; cloud cover is a fallback for when the station
+# reports no cloud layers.
+OPEN_METEO_ENDPOINT = "https://api.open-meteo.com/v1/forecast"
+
 # EPA AirNow air quality (https://docs.airnowapi.org/)
 # Free, rate-limited public key baked in for convenience so the app works
 # out of the box. Override with `export AIRNOW_API_KEY=...` if you want.
@@ -181,6 +186,24 @@ def compute_sun_times(lat, lon, day):
         return "--", "--"
 
 
+def fetch_open_meteo():
+    """
+    UV index (and cloud cover as a backstop) from Open-Meteo. Best effort: any
+    failure returns an empty dict so the panel still draws without these.
+    """
+    try:
+        resp = requests.get(OPEN_METEO_ENDPOINT, params={
+            "latitude": NWS_LAT,
+            "longitude": NWS_LON,
+            "current": "uv_index,cloud_cover",
+            "timezone": "America/Los_Angeles",
+        }, timeout=10)
+        resp.raise_for_status()
+        return resp.json().get("current") or {}
+    except Exception:
+        return {}
+
+
 def fetch_conditions():
     """
     Pull current conditions (nearest reporting NWS station) and the hourly
@@ -219,8 +242,14 @@ def fetch_conditions():
         vis_m = _nws_value(obs, "visibility")
         precip_mm = _nws_value(obs, "precipitationLastHour")
 
+        # Station cloud layers are observed but coarse (FEW/SCT/BKN/OVC); when
+        # the station reports none at all, fall back to Open-Meteo's percentage.
+        extra = fetch_open_meteo()
         layers = obs.get("cloudLayers") or []
         cloud = max((_CLOUD_PCT.get(l.get("amount"), 0) for l in layers), default=None)
+        if cloud is None:
+            cloud = extra.get("cloud_cover")
+        uv = extra.get("uv_index")
 
         current = {
             "temp_F": _fmt(temp_f),
@@ -231,7 +260,7 @@ def fetch_conditions():
             "pressureInches": _fmt(None if pressure_pa is None else pressure_pa / 3386.389, "{:.2f}"),
             "visibilityMiles": _fmt(None if vis_m is None else vis_m / 1609.344),
             "cloudcover": _fmt(cloud),
-            "uvIndex": "--",   # not published by NWS
+            "uvIndex": _fmt(uv, "{:.1f}"),   # Open-Meteo; NWS doesn't publish UV
             "precipInches": _fmt(0.0 if precip_mm is None else precip_mm / 25.4, "{:.1f}"),
             "weatherDesc": [{"value": obs.get("textDescription") or "--"}],
         }
