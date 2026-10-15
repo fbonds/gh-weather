@@ -9,7 +9,6 @@ import curses
 import json
 import math
 import os
-import re
 import time
 import requests
 from datetime import datetime, timedelta
@@ -44,50 +43,40 @@ BASE_INTERVAL = 60
 # reports no cloud layers.
 OPEN_METEO_ENDPOINT = "https://api.open-meteo.com/v1/forecast"
 
-# EPA AirNow air quality (https://docs.airnowapi.org/)
-# Free, rate-limited public key baked in for convenience so the app works
-# out of the box. Override with `export AIRNOW_API_KEY=...` if you want.
-AIRNOW_DEFAULT_KEY = "720C254B-BCF6-4839-81BA-86A28CEB8C6F"
-AIRNOW_API_KEY = os.environ.get("AIRNOW_API_KEY", "").strip() or AIRNOW_DEFAULT_KEY
-AIRNOW_ENDPOINT = "https://www.airnowapi.org/aq/observation/latLong/current/"
-AIRNOW_FORECAST_ENDPOINT = "https://www.airnowapi.org/aq/forecast/latLong/"
-AIRNOW_LAT = 47.3293      # Gig Harbor, WA
-AIRNOW_LON = -122.5804
-AIRNOW_DISTANCE = 25      # search radius in miles
-AQI_INTERVAL = 600        # AirNow updates hourly; poll every 10 minutes
+# Air quality from Open-Meteo (https://open-meteo.com/en/docs/air-quality-api)
+# — free, no API key. EPA AirNow was the original source, but it retired its
+# lat/long observation and forecast web services on 2026-10-01 (they now return
+# HTTP 410). Open-Meteo reports the US EPA AQI plus a sub-index per pollutant.
+# Values are modeled (CAMS), not read from a single nearby monitor.
+AQI_ENDPOINT = "https://air-quality-api.open-meteo.com/v1/air-quality"
+AQI_LAT = 47.3293         # Gig Harbor, WA
+AQI_LON = -122.5804
+AQI_INTERVAL = 600        # model updates hourly; poll every 10 minutes
+AQI_STALE_AFTER = 7200    # keep showing the last reading this long when fetches fail
 
-# Short reason shown as a pill under the AQI gauge (e.g. "Wildfire smoke").
-# By default it is auto-detected from AirNow's forecast discussion (see
-# fetch_aqi_reason). Set AQI_REASON to force a fixed label instead:
+# Per-pollutant US AQI sub-indices -> display name. The overall AQI is the
+# highest of these; the one that sets it is the "dominant" pollutant.
+AQI_POLLUTANTS = {
+    "us_aqi_pm2_5": "PM2.5",
+    "us_aqi_pm10": "PM10",
+    "us_aqi_ozone": "O3",
+    "us_aqi_nitrogen_dioxide": "NO2",
+    "us_aqi_carbon_monoxide": "CO",
+    "us_aqi_sulphur_dioxide": "SO2",
+}
+
+# Short reason shown as a pill under the AQI gauge, derived from the dominant
+# pollutant. Set AQI_REASON to force a fixed label instead:
 #   export AQI_REASON="Wildfires in WA"
 AQI_REASON = os.environ.get("AQI_REASON", "").strip() or None
-
-# Keyword -> short label rules used to summarize the forecast discussion into
-# a pill. First match wins; checked in order. Bare "fire" is deliberately not a
-# keyword — discussions name fires as landmarks ("near the Three Queens fire")
-# without implying local impact.
-AQI_REASON_RULES = [
-    (("wildfire", "wild fire", "smoke", "smoky"), "Wildfire smoke"),
-    (("blowing dust", "dust storm", "dust"), "Blowing dust"),
-    (("ozone",), "Elevated ozone"),
-    (("fine particle", "particle pollution", "pm2.5", "pm 2.5"), "Particle pollution"),
-]
-
-# The discussion is regional free text and routinely mentions a pollutant only
-# to rule it out ("limited ground level wildfire smoke"). A sentence carrying
-# any of these is treated as saying the pollutant is NOT the story, so it can't
-# produce a pill. Biased toward showing no pill over showing a wrong one.
-# Hedges count as negators too: "occasional smoky skies" and "potential for
-# intermittent impacts" describe what might happen somewhere in the region, not
-# what the local monitor is reading right now.
-AQI_REASON_NEGATORS = (
-    r"\blimited\b", r"\blittle\b", r"\bminimal\b", r"\bno\b", r"\bnot\b",
-    r"n't\b", r"\bunlikely\b", r"\bisolated\b", r"\bwithout\b", r"\bfree of\b",
-    r"\baway from\b", r"\bimproving\b", r"\bdiminish", r"\bsubsid",
-    r"\bdecreas", r"\bease", r"\babsent\b",
-    r"\boccasional", r"\bintermittent", r"\bpotential\b", r"\bpatchy\b",
-    r"\bbrief", r"\bchance of\b", r"\bpossible\b",
-)
+AQI_REASON_BY_POLLUTANT = {
+    "PM2.5": "Fine particles",
+    "PM10": "Coarse particles",
+    "O3": "Elevated ozone",
+    "NO2": "Nitrogen dioxide",
+    "CO": "Carbon monoxide",
+    "SO2": "Sulfur dioxide",
+}
 
 # The pill explains why air quality is degraded, so it is only meaningful once
 # the reading actually is. Index into AQI_CATEGORIES: 1 == Moderate or worse.
@@ -299,126 +288,45 @@ def fetch_conditions():
 
 def fetch_air_quality():
     """
-    Pull current AQI observations from EPA AirNow for the configured
-    location. AirNow returns one observation per pollutant (O3, PM2.5,
-    PM10); we surface the dominant (highest) AQI. Returns (result, error).
+    Pull the current US AQI from Open-Meteo for the configured location, with
+    the dominant (highest sub-index) pollutant. Returns (result, error); the
+    error is a short diagnostic for logs, never shown in the UI.
     """
-    if not AIRNOW_API_KEY:
-        return None, "set AIRNOW_API_KEY"
-
-    params = {
-        "format": "application/json",
-        "latitude": AIRNOW_LAT,
-        "longitude": AIRNOW_LON,
-        "distance": AIRNOW_DISTANCE,
-        "API_KEY": AIRNOW_API_KEY,
-    }
     try:
-        resp = requests.get(AIRNOW_ENDPOINT, params=params, timeout=10)
+        resp = requests.get(AQI_ENDPOINT, params={
+            "latitude": AQI_LAT,
+            "longitude": AQI_LON,
+            "current": ",".join(["us_aqi", *AQI_POLLUTANTS]),
+            "timezone": "America/Los_Angeles",
+        }, timeout=10)
         resp.raise_for_status()
-        observations = resp.json()
+        current = resp.json().get("current") or {}
 
-        if not observations:
+        aqi = current.get("us_aqi")
+        if aqi is None:
             return None, "no AQI data"
 
-        # Dominant pollutant = the one with the highest AQI reading.
-        dominant = max(observations, key=lambda o: o.get("AQI", -1))
+        readings = {name: current[key] for key, name in AQI_POLLUTANTS.items()
+                    if current.get(key) is not None}
+        dominant = max(readings, key=readings.get) if readings else ""
+        idx = _aqi_index_by_value(aqi)
         result = {
-            "aqi": dominant.get("AQI", "--"),
-            "parameter": dominant.get("ParameterName", ""),
-            "category": dominant.get("Category", {}).get("Name", "--"),
-            "area": dominant.get("ReportingArea", ""),
-            "readings": {
-                o.get("ParameterName", "?"): o.get("AQI", "--")
-                for o in observations
-            },
+            "aqi": aqi,
+            "parameter": dominant,
+            "category": AQI_CATEGORIES[idx][0],
+            "readings": readings,
+            "reason": AQI_REASON_BY_POLLUTANT.get(dominant),
+            "fetched": time.time(),
         }
         return result, None
     except requests.exceptions.Timeout:
         return None, "AQI timeout"
     except requests.exceptions.RequestException as e:
-        return None, f"AQI net error: {str(e)[:20]}"
+        return None, f"AQI net error: {e}"
     except (json.JSONDecodeError, ValueError):
         return None, "AQI bad JSON"
     except Exception as e:
-        return None, f"AQI error: {str(e)[:20]}"
-
-
-def fetch_aqi_reason():
-    """
-    Derive a short cause/reason for current air quality from AirNow's forecast
-    discussion (e.g. "Wildfire smoke"). Returns a label string or None. Best
-    effort only — the discussion is free text and often empty, so any failure
-    just yields None (no pill shown).
-    """
-    if not AIRNOW_API_KEY:
-        return None
-
-    params = {
-        "format": "application/json",
-        "latitude": AIRNOW_LAT,
-        "longitude": AIRNOW_LON,
-        "distance": AIRNOW_DISTANCE,
-        "API_KEY": AIRNOW_API_KEY,
-    }
-    try:
-        resp = requests.get(AIRNOW_FORECAST_ENDPOINT, params=params, timeout=10)
-        resp.raise_for_status()
-        entries = resp.json()
-        if not entries:
-            return None
-
-        # AirNow returns one entry per pollutant per forecast day. Use today's
-        # discussion — the later days describe weather we aren't reporting on.
-        today = datetime.now().strftime("%Y-%m-%d")
-        discussion = ""
-        action_day = False
-        for e in entries:
-            if (e.get("DateForecast") or "").strip()[:10] != today:
-                continue
-            text = (e.get("Discussion") or "").strip()
-            if text and not discussion:
-                discussion = text
-            if e.get("ActionDay"):
-                action_day = True
-
-        if not discussion:
-            for e in entries:
-                text = (e.get("Discussion") or "").strip()
-                if text:
-                    discussion = text
-                    break
-
-        label = _match_reason(discussion)
-        if label:
-            return label
-        if action_day:
-            return "Air Quality Action Day"
-        return None
-    except Exception:
-        return None
-
-
-def _match_reason(discussion):
-    """
-    Summarize a forecast discussion into a short pill label, or None.
-
-    Matching is per sentence rather than over the whole blob, and sentences that
-    negate their pollutant are skipped — otherwise "limited ground level
-    wildfire smoke" reads as a wildfire smoke alert.
-    """
-    for sentence in re.split(r"(?<=[.;!?])\s+", (discussion or "").lower()):
-        # "GOOD air quality overall, but limited smoke" — the negation attaches
-        # to the clause, so score each clause independently.
-        for clause in re.split(r",?\s+\bbut\b\s+|;\s*|,\s*(?=however\b)", sentence):
-            if not clause.strip():
-                continue
-            if any(re.search(n, clause) for n in AQI_REASON_NEGATORS):
-                continue
-            for keywords, label in AQI_REASON_RULES:
-                if any(k in clause for k in keywords):
-                    return label
-    return None
+        return None, f"AQI error: {e}"
 
 
 def compute_dew_point(temp_f, humidity):
@@ -543,48 +451,6 @@ def _aqi_index_by_name(name):
     return -1
 
 
-def seg_attr(idx):
-    """curses attribute for AQI category index 0..5 (green -> maroon)."""
-    if not curses.has_colors():
-        return curses.A_BOLD
-    if idx == 0:
-        return curses.color_pair(5) | curses.A_BOLD                    # green
-    if idx == 1:
-        return curses.color_pair(3) | curses.A_BOLD                    # yellow
-    if idx == 2:                                                       # orange
-        return (curses.color_pair(7) if HAVE_256 else curses.color_pair(3)) | curses.A_BOLD
-    if idx == 3:
-        return curses.color_pair(6) | curses.A_BOLD                    # red
-    if idx == 4:
-        return curses.color_pair(2) | curses.A_BOLD                    # magenta (purple)
-    if idx == 5:                                                       # maroon
-        return (curses.color_pair(8) if HAVE_256 else curses.color_pair(6)) | curses.A_BOLD
-    return curses.color_pair(4)
-
-
-def aqi_color(category):
-    """Map an EPA AQI category name to a curses attribute."""
-    idx = _aqi_index_by_name(category)
-    if idx < 0:
-        return curses.color_pair(4) if curses.has_colors() else curses.A_BOLD
-    return seg_attr(idx)
-
-
-def _aqi_needle_angle(value):
-    """
-    Needle angle in degrees across the 180deg arc: 180 = far left (low AQI),
-    0 = far right (high AQI). Each category occupies an equal 30deg slice and
-    the needle interpolates by where the value falls within that category.
-    """
-    idx = _aqi_index_by_value(value)
-    _full, _short, lo, hi = AQI_CATEGORIES[idx]
-    span = hi - lo
-    frac = 0.0 if span <= 0 else (value - lo) / span
-    frac = max(0.0, min(1.0, frac))
-    seg_start = 180 - idx * 30           # left (low) edge of this segment
-    return seg_start - frac * 30
-
-
 def safe_addstr(win, row, col, text, attr=0):
     """Write string to window, ignoring out-of-bounds errors."""
     max_y, max_x = win.getmaxyx()
@@ -670,32 +536,8 @@ def _blit(stdscr, top, left, canvas, field):
                 safe_addstr(stdscr, r, left + x, "▀", _pair_for(t, b))
 
 
-def _in_triangle(px, py, ax, ay, bx, by, cx, cy):
-    """True if point (px,py) is inside triangle a,b,c."""
-    d1 = (px - bx) * (ay - by) - (ax - bx) * (py - by)
-    d2 = (px - cx) * (by - cy) - (bx - cx) * (py - cy)
-    d3 = (px - ax) * (cy - ay) - (cx - ax) * (py - ay)
-    neg = (d1 < 0) or (d2 < 0) or (d3 < 0)
-    pos = (d1 > 0) or (d2 > 0) or (d3 > 0)
-    return not (neg and pos)
-
-
-# Coverage -> shade glyph. Partial coverage picks a lighter-density block so
-# the fg color blends toward the background, anti-aliasing curved silhouettes.
-def _shade_char(cov):
-    if cov >= 0.86:
-        return "█"
-    if cov >= 0.60:
-        return "▓"
-    if cov >= 0.34:
-        return "▒"
-    if cov >= 0.12:
-        return "░"
-    return " "
-
-
 # Per-category color ramps (dark rim, base, bright crown) — 256-color only.
-# Used to shade the band like a rounded tube and the disc like a lit sphere.
+# Used to bevel the number plate.
 _AQI_RAMP = {
     0: (22, 34, 46),      # green
     1: (136, 184, 226),   # yellow
@@ -704,13 +546,6 @@ _AQI_RAMP = {
     4: (54, 97, 140),     # purple
     5: (52, 88, 124),     # maroon
 }
-_NEEDLE_RAMP = (240, 250, 255)
-
-
-# Smooth 6-stop AQI gradient (green -> maroon) as RGB anchors, blended per
-# column and quantized to the xterm-256 cube for the linear scale bar.
-_AQI_GRAD = [(0, 210, 0), (240, 220, 0), (255, 130, 0),
-             (230, 0, 0), (150, 50, 190), (135, 20, 20)]
 
 
 def _rgb256(r, g, b):
@@ -718,16 +553,6 @@ def _rgb256(r, g, b):
     lv = (0, 95, 135, 175, 215, 255)
     q = lambda v: min(range(6), key=lambda i: abs(lv[i] - v))
     return 16 + 36 * q(r) + 6 * q(g) + q(b)
-
-
-def _grad_rgb(t):
-    """Sample the AQI gradient at t in [0,1] -> (r,g,b)."""
-    t = max(0.0, min(1.0, t))
-    p = t * (len(_AQI_GRAD) - 1)
-    i = min(len(_AQI_GRAD) - 2, int(p))
-    f = p - i
-    a, b = _AQI_GRAD[i], _AQI_GRAD[i + 1]
-    return tuple(int(a[k] + (b[k] - a[k]) * f) for k in range(3))
 
 
 # Category colors positioned at their true AQI value (range midpoints), so a
@@ -749,116 +574,6 @@ def _aqi_scale_rgb(v):
             f = (v - v0) / (v1 - v0)
             return tuple(int(c0[k] + (c1[k] - c0[k]) * f) for k in range(3))
     return _AQI_SCALE[-1][1]
-
-
-def draw_aqi_panel(stdscr, top, dleft, dwidth, aqi, aqi_error, reason, height):
-    """
-    Render the air quality as a clean, linear ANSI panel: a beveled number
-    plate tinted to the level, then a smooth green->maroon gradient scale bar
-    with a pointer marking where the reading falls. Sized to `height` rows so
-    it aligns with the stats panel for a single, unified interface.
-    """
-    pal = _aqi_palette()
-    field = THEME.get("panel_bg", pal["field"]) if THEME else pal["field"]
-    frame_color = THEME["raw"]["border"] if THEME else pal["frame"]
-    seg = pal["seg"]
-    iw = dwidth - 2
-    ileft = dleft + 1
-    bottom = top + height - 1
-
-    # --- Frame + solid field background ---
-    frame_attr = _pair_for(frame_color, field) | curses.A_BOLD
-    fieldpair = _pair_for(field, field)
-    safe_addstr(stdscr, top, dleft, "╔" + "═" * iw + "╗", frame_attr)
-    for r in range(top + 1, bottom):
-        safe_addstr(stdscr, r, dleft, "║", frame_attr)
-        safe_addstr(stdscr, r, ileft, " " * iw, fieldpair)
-        safe_addstr(stdscr, r, dleft + dwidth - 1, "║", frame_attr)
-    safe_addstr(stdscr, bottom, dleft, "╚" + "═" * iw + "╝", frame_attr)
-
-    _center(stdscr, "CURRENT AIR QUALITY", top + 1, ileft, iw,
-            _pair_for(pal["head"], field) | curses.A_BOLD)
-
-    # --- Parse the numeric AQI ---
-    value = None
-    category = ""
-    if aqi:
-        category = aqi.get("category", "")
-        try:
-            value = int(float(aqi.get("aqi")))
-        except (TypeError, ValueError):
-            value = None
-    level_idx = _aqi_index_by_name(category) if value is not None else -1
-
-    if value is None:
-        _center(stdscr, "--", top + height // 2 - 1, ileft, iw, _pair_for(pal["white"], field))
-        _center(stdscr, aqi_error or "unavailable", top + height // 2, ileft, iw,
-                _pair_for(pal["white"], field))
-        return
-
-    if HAVE_256 and level_idx >= 0:
-        dark, base, crown = _AQI_RAMP[level_idx]
-    else:
-        dark = base = crown = seg[max(0, level_idx)]
-    ink = pal["ink"] if level_idx in (0, 1, 2) else pal["white"]
-
-    # --- Beveled number plate (crown highlight, base body, dark shadow) ---
-    num = str(value)
-    plate_w = len(num) + 6
-    pl = ileft + (iw - plate_w) // 2
-    pt = top + 3
-    safe_addstr(stdscr, pt, pl, "▀" * plate_w, _pair_for(crown, base))
-    safe_addstr(stdscr, pt + 1, pl, " " * plate_w, _pair_for(base, base))
-    _center(stdscr, num, pt + 1, ileft, iw, _pair_for(ink, base) | curses.A_BOLD)
-    safe_addstr(stdscr, pt + 2, pl, "▄" * plate_w, _pair_for(dark, base))
-    _center(stdscr, "AQI", pt + 3, ileft, iw, _pair_for(crown, field) | curses.A_BOLD)
-    short = AQI_CATEGORIES[level_idx][1] if level_idx >= 0 else (category or "--")
-    _center(stdscr, short.upper(), pt + 4, ileft, iw, _pair_for(crown, field) | curses.A_BOLD)
-
-    # --- Linear gradient scale bar (lit top row, shadowed bottom row) ---
-    bar_top = pt + 7
-    barW = max(6, iw - 4)
-    bl = ileft + (iw - barW) // 2
-    for c in range(barW):
-        t = c / (barW - 1) if barW > 1 else 0.0
-        if HAVE_256:
-            r, g, b = _grad_rgb(t)
-            top_c = _rgb256(r, g, b)
-            dk_c = _rgb256(int(r * 0.45), int(g * 0.45), int(b * 0.45))
-        else:
-            top_c = dk_c = seg[min(5, int(t * 6))]
-        safe_addstr(stdscr, bar_top, bl + c, "█", _pair_for(top_c, field))
-        safe_addstr(stdscr, bar_top + 1, bl + c, "█", _pair_for(dk_c, field))
-
-    # --- Pointer at the reading's position within the scale ---
-    idx = _aqi_index_by_value(value)
-    _f, _s, lo, hi = AQI_CATEGORIES[idx]
-    fw = 0.0 if hi == lo else (value - lo) / (hi - lo)
-    fw = max(0.0, min(1.0, fw))
-    pos = (idx + fw) / 6.0
-    pcol = bl + int(round(pos * (barW - 1)))
-    safe_addstr(stdscr, bar_top + 2, pcol, "▲", _pair_for(pal["white"], field) | curses.A_BOLD)
-
-    # --- Scale tick labels: anchor both ends, then fill the middle greedily ---
-    tick_color = 245 if HAVE_256 else pal["white"]
-    tickattr = _pair_for(tick_color, field)
-    trow = bar_top + 3
-    s500 = bl + barW - 3
-    safe_addstr(stdscr, trow, bl, "0", tickattr)
-    safe_addstr(stdscr, trow, s500, "500", tickattr)
-    last_end = bl + 2
-    for txt, fr in [("50", 1 / 6), ("100", 2 / 6), ("150", 3 / 6),
-                    ("200", 4 / 6), ("300", 5 / 6)]:
-        col = bl + int(round(fr * (barW - 1)))
-        s = col - len(txt) // 2
-        if s > last_end and s + len(txt) < s500:
-            safe_addstr(stdscr, trow, s, txt, tickattr)
-            last_end = s + len(txt)
-
-    # --- Reason pill (only when known, and only when the air is actually bad) ---
-    if reason and level_idx >= AQI_REASON_MIN_INDEX and bottom - 2 > bar_top + 3:
-        pill_attr = _pair_for(pal["pill_fg"], pal["pill_bg"]) | curses.A_BOLD
-        _center(stdscr, f"  {reason}  ", bottom - 2, ileft, iw, pill_attr)
 
 
 # ---------------------------------------------------------------------------
@@ -1108,7 +823,58 @@ def draw_hero(stdscr, top, left, width, hcells, title, subtitle):
     _center(stdscr, subtitle, top + 6, left, width, sub_attr)
 
 
-def draw_aqi_content(stdscr, top, cleft, cw, oright, border, aqi, aqi_error, reason, height):
+def _draw_aqi_plate(stdscr, pt, cleft, cw, text, dark, base, crown, ink):
+    """Beveled number plate (3 rows) centered in the column."""
+    plate_w = len(text) + 6
+    pl = cleft + (cw - plate_w) // 2
+    safe_addstr(stdscr, pt, pl, "▀" * plate_w, _pair_for(crown, base))
+    safe_addstr(stdscr, pt + 1, pl, " " * plate_w, _pair_for(base, base))
+    _center(stdscr, text, pt + 1, cleft, cw, _pair_for(ink, base) | curses.A_BOLD)
+    safe_addstr(stdscr, pt + 2, pl, "▄" * plate_w, _pair_for(dark, base))
+
+
+# Greys for the "no data" ghost gauge (256-color).
+_AQI_GHOST = (236, 239, 242)   # plate dark rim, base, crown
+_AQI_DIM_TEXT = 245
+
+
+def _draw_aqi_unavailable(stdscr, top, cleft, cw, field, pal, height, retry_at):
+    """
+    Placeholder when there's no reading: the usual plate and scale drawn as a
+    greyed-out "ghost" so the layout doesn't jump, plus a plain-language note.
+    Raw errors stay out of the UI.
+    """
+    if HAVE_256:
+        dark, base, crown = _AQI_GHOST
+        dim, bar_hi, bar_lo = _AQI_DIM_TEXT, 240, 237
+    else:
+        dark = base = crown = bar_hi = bar_lo = curses.COLOR_BLACK
+        dim = pal["white"]
+
+    pt = top + 2
+    _draw_aqi_plate(stdscr, pt, cleft, cw, "--", dark, base, crown, dim)
+    _center(stdscr, "AQI", pt + 3, cleft, cw, _pair_for(dim, field) | curses.A_BOLD)
+
+    bar_top = pt + 5
+    barW = min(cw - 2, 26)
+    bl = cleft + (cw - barW) // 2
+    safe_addstr(stdscr, bar_top, bl, "█" * barW, _pair_for(bar_hi, field))
+    safe_addstr(stdscr, bar_top + 1, bl, "█" * barW, _pair_for(bar_lo, field))
+
+    lines = [("Air quality unavailable", pal["white"], curses.A_BOLD),
+             ("Can't reach the data source", dim, 0)]
+    if retry_at:
+        lines.append((f"Retrying at {retry_at.strftime('%H:%M')}", dim, 0))
+    row = bar_top + 3
+    for text, color, extra in lines:
+        if row >= top + height:
+            break
+        _center(stdscr, text, row, cleft, cw, _pair_for(color, field) | extra)
+        row += 1
+
+
+def draw_aqi_content(stdscr, top, cleft, cw, oright, border, aqi, aqi_error, reason, height,
+                     aqi_retry=None):
     """Air-quality column content (no frame): fills its own background and
     right border each row, then draws the number plate and linear scale."""
     pal = _aqi_palette()
@@ -1132,8 +898,7 @@ def draw_aqi_content(stdscr, top, cleft, cw, oright, border, aqi, aqi_error, rea
     level_idx = _aqi_index_by_name(category) if value is not None else -1
 
     if value is None:
-        _center(stdscr, aqi_error or "unavailable", top + height // 2, cleft, cw,
-                _pair_for(pal["white"], field))
+        _draw_aqi_unavailable(stdscr, top, cleft, cw, field, pal, height, aqi_retry)
         return
 
     if HAVE_256 and level_idx >= 0:
@@ -1142,17 +907,16 @@ def draw_aqi_content(stdscr, top, cleft, cw, oright, border, aqi, aqi_error, rea
         dark = base = crown = seg[max(0, level_idx)]
     ink = pal["ink"] if level_idx in (0, 1, 2) else pal["white"]
 
-    num = str(value)
-    plate_w = len(num) + 6
-    pl = cleft + (cw - plate_w) // 2
     pt = top + 2
-    safe_addstr(stdscr, pt, pl, "▀" * plate_w, _pair_for(crown, base))
-    safe_addstr(stdscr, pt + 1, pl, " " * plate_w, _pair_for(base, base))
-    _center(stdscr, num, pt + 1, cleft, cw, _pair_for(ink, base) | curses.A_BOLD)
-    safe_addstr(stdscr, pt + 2, pl, "▄" * plate_w, _pair_for(dark, base))
+    _draw_aqi_plate(stdscr, pt, cleft, cw, str(value), dark, base, crown, ink)
     _center(stdscr, "AQI", pt + 3, cleft, cw, _pair_for(crown, field) | curses.A_BOLD)
     short = AQI_CATEGORIES[level_idx][1] if level_idx >= 0 else (category or "--")
     _center(stdscr, short.upper(), pt + 4, cleft, cw, _pair_for(crown, field) | curses.A_BOLD)
+    # Latest fetch failed but an earlier reading is still fresh enough to show.
+    if aqi_error and aqi.get("fetched"):
+        as_of = datetime.fromtimestamp(aqi["fetched"]).strftime("%H:%M")
+        _center(stdscr, f"as of {as_of}", pt + 5, cleft, cw,
+                _pair_for(_AQI_DIM_TEXT if HAVE_256 else pal["white"], field))
 
     # Linear 0-500 scale: each column's AQI value maps to its category color,
     # with a lit top row and a shadowed bottom row for depth. barW is chosen so
@@ -1195,7 +959,8 @@ def draw_aqi_content(stdscr, top, cleft, cw, oright, border, aqi, aqi_error, rea
         _center(stdscr, f"  {reason}  ", top + height - 2, cleft, cw, pill)
 
 
-def render(stdscr, data, start_time, cycle_count, next_interval, sync_needed=False, error_msg=None, aqi=None, aqi_error=None, reason=None):
+def render(stdscr, data, start_time, cycle_count, next_interval, sync_needed=False, error_msg=None, aqi=None, aqi_error=None, reason=None,
+           aqi_retry=None):
     """Render weather dashboard within the current terminal window."""
     stdscr.erase()
     max_y, max_x = stdscr.getmaxyx()
@@ -1335,12 +1100,12 @@ def render(stdscr, data, start_time, cycle_count, next_interval, sync_needed=Fal
     # --- Right column: air quality (matched to the body height) ---
     if two_col:
         draw_aqi_content(stdscr, body_top, dv + 1, RIGHT_IW, oright, border,
-                         aqi, aqi_error, reason, body_h)
+                         aqi, aqi_error, reason, body_h, aqi_retry)
     else:
         # Narrow fallback: a compact AQI line inside the left column.
         _panel_row(stdscr, body_bottom, left, sw, border, bgpair)
         cat = aqi.get("category", "--") if aqi else ""
-        txt = f"{aqi.get('aqi','--')} {cat}" if aqi else (aqi_error or "unavailable")
+        txt = f"{aqi.get('aqi','--')} {cat}" if aqi else "unavailable"
         safe_addstr(stdscr, body_bottom, lx, "Air Quality:", T["label"])
         safe_addstr(stdscr, body_bottom, vx, txt, T["value"])
         body_bottom += 1
@@ -1425,8 +1190,12 @@ def main(stdscr):
                 aqi_error = None
             else:
                 aqi_error = aqi_err
-            # Manual override wins; otherwise auto-detect from the forecast.
-            aqi_reason = AQI_REASON or fetch_aqi_reason()
+                # A recent reading is still useful (shown with an "as of"
+                # note); an old one is misleading, so drop it.
+                if aqi_data and now - aqi_data["fetched"] > AQI_STALE_AFTER:
+                    aqi_data = None
+            # Manual override wins; otherwise label the dominant pollutant.
+            aqi_reason = AQI_REASON or (aqi_data or {}).get("reason")
 
         # Fetch new data when interval has elapsed
         sync_needed = False
@@ -1457,7 +1226,8 @@ def main(stdscr):
         # Render dashboard
         try:
             render(stdscr, data, start_time, cycle_count, next_interval,
-                   sync_needed, error_msg, aqi_data, aqi_error, aqi_reason)
+                   sync_needed, error_msg, aqi_data, aqi_error, aqi_reason,
+                   datetime.fromtimestamp(last_aqi_fetch + AQI_INTERVAL))
         except curses.error:
             pass
 
